@@ -378,22 +378,6 @@ preflight() {
     fi
     ok "Opciones válidas (teclado '$KEYMAP', fuente '$FONT_NAME' a $FONT_SIZE pt)"
 
-    # Antigüedad de la ISO: con una muy vieja, los paquetes nuevos pueden pedir librerías nuevas.
-    if (( IS_LIVE )) && [[ -r /version ]]; then
-        local iso="" iso_epoch="" now days
-        iso=$(head -n 1 /version 2>/dev/null) || iso=""
-        iso=${iso//[[:space:]]/}
-        if [[ $iso =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}$ ]] && iso_epoch=$(date -d "${iso//./-}" +%s 2>/dev/null); then
-            now=$(date +%s)
-            days=$(( (now - iso_epoch) / 86400 ))
-            if (( days > 60 )); then
-                warn "La ISO es del $iso (hace $days días). Si al instalar falta alguna librería, usa una ISO más reciente."
-            else
-                ok "ISO del $iso"
-            fi
-        fi
-    fi
-
     # Hora: con el reloj mal fallan las firmas de pacman y los certificados.
     local ntp=""
     ntp=$(timedatectl show -p NTPSynchronized --value 2>/dev/null) || ntp=""
@@ -522,15 +506,26 @@ install_packages() {
     ok "Paquetes instalados"
 }
 
+# Librerías que le faltan al binario $1, separadas por '; ' (vacío si no falta ninguna).
+missing_libs() {
+    local out=""
+    out=$(ldd -- "${1:?missing_libs: falta el archivo}" 2>&1) || true
+    awk '/not found/ { sub(/^[ \t]+/, ""); printf "%s; ", $0 }' <<<"$out"
+}
+
 # Comprueba que lo instalado funciona ANTES de cambiar ninguna configuración.
+# Solo es obligatorio lo que kmscon necesita para arrancar y dibujar texto: los
+# módulos de aceleración 3D (mod-drm3d, mod-gltex) piden libGL/EGL, que en un
+# live sin mesa no existen; kmscon avisa al arrancar y dibuja por software.
 verify_install() {
     if (( DRY_RUN )); then
         info "[DRY ] Aquí se comprobaría que tmux y kmscon tienen todas sus librerías"
+        FONT_ENGINE=freetype
         return 0
     fi
     info "Comprobando que lo instalado funciona…"
-    local -a problems=() files=()
-    local p f out libs unit_path=""
+    local -a problems=() bins=() optional=()
+    local p f libs engine unit_path=""
 
     for p in "${PACKAGES[@]}"; do
         if ! pacman -Qq -- "$p" >/dev/null 2>&1; then problems+=("el paquete $p no está instalado"); fi
@@ -544,23 +539,53 @@ verify_install() {
 
     if ! tmux -V >/dev/null 2>&1; then problems+=("tmux no se ejecuta"); fi
 
-    for f in /usr/bin/kmscon /usr/lib/kmscon/*; do
-        if [[ -f $f ]]; then files+=("$f"); fi
+    # Imprescindibles: el ejecutable de kmscon y tmux.
+    for f in /usr/lib/kmscon/kmscon /usr/bin/kmscon; do
+        if [[ -f $f ]]; then bins+=("$f"); fi
     done
-    if (( ${#files[@]} == 0 )); then problems+=("no encuentro el ejecutable de kmscon"); fi
-    files+=(/usr/bin/tmux)
+    if (( ${#bins[@]} == 0 )); then problems+=("no encuentro el ejecutable de kmscon"); fi
+    bins+=(/usr/bin/tmux)
+    for f in "${bins[@]}"; do
+        libs=$(missing_libs "$f")
+        if [[ -n $libs ]]; then problems+=("$f necesita: $libs"); fi
+    done
 
-    for f in "${files[@]}"; do
-        out=$(ldd -- "$f" 2>&1) || true
-        libs=$(awk '/not found/ { sub(/^[ \t]+/, ""); printf "%s; ", $0 }' <<<"$out")
-        if [[ -n $libs ]]; then problems+=("$f -> $libs"); fi
+    # Motor de fuentes: freetype primero (el predeterminado de kmscon y el que más se
+    # mejora: suavizado, sustitución de glifos que faltan); pango, de respaldo.
+    FONT_ENGINE=""
+    for engine in freetype pango; do
+        f=/usr/lib/kmscon/mod-${engine}.so
+        if [[ ! -f $f ]]; then continue; fi
+        libs=$(missing_libs "$f")
+        if [[ -z $libs ]]; then
+            FONT_ENGINE=$engine
+            break
+        fi
+        warn "El motor de fuentes '$engine' no se puede usar (le falta: $libs)"
     done
+    if [[ -z $FONT_ENGINE ]]; then
+        warn "No hay motor de fuentes escalables; kmscon usará su fuente de mapa de bits"
+    fi
+
+    # Opcionales: si les falta algo, solo se informa.
+    for f in /usr/lib/kmscon/mod-*.so; do
+        case ${f##*/} in
+            mod-pango.so|mod-freetype.so) continue ;;
+            *) ;;
+        esac
+        libs=$(missing_libs "$f")
+        if [[ -n $libs ]]; then optional+=("${f##*/}"); fi
+    done
+    if (( ${#optional[@]} > 0 )); then
+        info "Módulos opcionales de kmscon sin sus librerías: ${optional[*]}"
+        info "  Es la aceleración por GPU: no hace falta para la consola. kmscon avisará de ello al arrancar; se puede ignorar."
+    fi
 
     if (( ${#problems[@]} > 0 )); then
         for p in "${problems[@]}"; do err "  $p"; done
-        die "Lo instalado no funciona bien. Lo más probable es que la ISO sea antigua y los paquetes nuevos pidan librerías más recientes: usa una ISO actual. No se ha cambiado ninguna configuración."
+        die "Lo instalado no funciona: arriba tienes qué falta. No se ha cambiado ninguna configuración."
     fi
-    ok "tmux y kmscon instalados y con todas sus librerías"
+    ok "tmux y kmscon instalados y con todo lo que necesitan (fuentes con '${FONT_ENGINE:-mapa de bits}')"
 }
 
 configure_fonts() {
@@ -578,18 +603,6 @@ configure_fonts() {
         info "[DRY ] La fuente '$FONT_NAME' se instalaría con ttf-jetbrains-mono"
     else
         warn "No encuentro la fuente '$FONT_NAME'; kmscon usará otra monoespaciada"
-    fi
-
-    # Motor de fuentes: pango es el más probado; freetype, el de respaldo.
-    if [[ -f /usr/lib/kmscon/mod-pango.so ]]; then
-        FONT_ENGINE=pango
-    elif [[ -f /usr/lib/kmscon/mod-freetype.so ]]; then
-        FONT_ENGINE=freetype
-    elif (( DRY_RUN )); then
-        FONT_ENGINE=pango
-    else
-        FONT_ENGINE=""
-        warn "kmscon no tiene motor de fuentes escalables; usará su fuente de mapa de bits"
     fi
 }
 
